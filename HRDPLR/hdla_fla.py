@@ -1,0 +1,295 @@
+import math
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, repeat
+from fla.ops.generalized_delta_rule import (
+    chunk_dplr_delta_rule,
+    fused_recurrent_dplr_delta_rule,
+)
+from torch.distributed.tensor import DTensor
+from transformers.cache_utils import Cache
+
+from .activations import get_activation_fn
+from .normalizations import get_norm_fn, l2_norm
+from .normalizations.normalization_utils import HDLA_DEBUG, _initialize_weights, print_module, print_params
+
+
+class HDLA_FLA(nn.Module):
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        bias: bool = False,
+        layer_idx: int = 0,
+        use_output_gate: bool = True,
+        token_mixer_norm_type: str = "rmsnorm",
+        q_activation: str = "silu",
+        k_activation: str = "silu",
+        v_activation: str = "silu",
+        use_beta: bool = True,
+        beta_activation: str = "neg",
+        qkv_norm_type: int = 2,
+        norm_q: bool = False,
+        norm_v: bool = False,
+        causal: bool = True,
+        max_position_embeddings: int = 1024,
+        token_mixer_init_type: int = 4,
+        rescale_type: int = 2,
+        num_hidden_layers: int = 12,
+        init_std: float = 0.02,
+        gain: float = 0.01,
+        gate_act: str = "sigmoid",
+        gate_pos: str = "pre",
+        threshold: float = 0.99,
+        use_offset: bool = False,
+        num_blocks: int = 1,
+        **kwargs,
+    ):
+        super().__init__()
+        if HDLA_DEBUG:
+            # get local varables
+            params = locals()
+            # print params
+            print_params(**params)
+
+        assert causal, f"Only causal={causal} is supported"
+
+        self.layer_idx = layer_idx
+        self.causal = causal
+        self.use_output_gate = use_output_gate
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.head_dim = embed_dim // num_heads
+        self.f_proj = nn.Sequential(
+            nn.Linear(embed_dim, self.head_dim, bias=bias),
+            nn.Linear(self.head_dim, embed_dim, bias=bias),
+        )
+        self.use_beta = use_beta
+        if self.use_beta:
+            # !!! dont use beta as name in hf: https://github.com/huggingface/transformers/issues/29554
+            self.bet_proj = nn.Linear(embed_dim, num_heads, bias=bias)
+        self.o_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_act = get_activation_fn(q_activation)
+        self.k_act = get_activation_fn(k_activation)
+        self.v_act = get_activation_fn(v_activation)
+        self.beta_activation = beta_activation
+        norm_type = (
+            f"{token_mixer_norm_type}_fused_gate"
+            if use_output_gate
+            else token_mixer_norm_type
+        )
+        self.norm = get_norm_fn(norm_type)(
+            embed_dim,
+            bias=bias,
+            gate_act=gate_act,
+            gate_pos=gate_pos,
+            num_groups=num_heads,
+        )
+
+        if self.use_output_gate:
+            self.output_gate = nn.Sequential(
+                nn.Linear(embed_dim, self.head_dim, bias=bias),
+                nn.Linear(self.head_dim, embed_dim, bias=bias),
+            )
+
+        self.embed_dim = embed_dim
+        self.use_offset = use_offset
+        self.threshold = threshold
+
+        self.qkv_norm_type = qkv_norm_type
+        self.norm_q = norm_q
+        self.norm_v = norm_v
+        self.token_mixer_init_type = token_mixer_init_type
+        self.rescale_type = rescale_type
+        self.num_hidden_layers = num_hidden_layers
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.init_std = init_std
+        self.gain = gain
+        self.num_blocks = num_blocks
+        self._init_weights()
+        self.f = torch.empty(0)
+        self.zero_qk = torch.empty(0)
+        self.zero_v = torch.empty(0)
+
+    def _init_weights(self):
+        self.setup_decay()
+        self.apply(self._initialize_weights)
+
+    def _initialize_weights(self, module):
+        self.setup_decay()
+        return _initialize_weights(self, module)
+
+    def setup_decay(self):
+        if not self.use_offset:
+            return
+        # take x = 0 as median, 1 / (1 + exp(-(median + delta))) = a => 1 + exp(-delta) = 1 / a => exp(-delta) = (1 / a - 1) -> exp(delta) = a / (1 - a) => delta = log(a / (1 - a))
+        a = self.threshold
+        # !!! important: don't use bias as hf fail to save it
+        offset = torch.ones(self.embed_dim) * math.log(a / (1 - a))
+        if hasattr(self, "offset"):
+            if isinstance(self.offset, DTensor):
+                self.offset.data.copy_(
+                    DTensor.from_local(
+                        offset,
+                        device_mesh=self.offset.device_mesh,
+                    )
+                )
+            else:
+                self.offset.data.copy_(offset)
+        else:
+            self.offset = nn.Parameter(offset, requires_grad=True)
+
+    def extra_repr(self):
+        return print_module(self)
+
+    def forward(
+        self,
+        x,
+        attention_mask: Optional[torch.Tensor] = None,  # (b, m)
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        lower_bound: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        b, n, d = x.shape
+        h = d // self.head_dim
+        # x: b n d
+        # linear map
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        if self.use_offset:
+            f = self.f_proj(x) + self.offset
+        else:
+            f = self.f_proj(x)
+
+        if self.zero_qk.shape[0] == 0 or self.zero_qk.shape[:2] != torch.Size([b, n]):
+            self.zero_qk = torch.zeros(
+                b, n, h * self.num_blocks, d // h // self.num_blocks
+            ).to(q)
+        if self.zero_v.shape[0] == 0 or self.zero_v.shape[:2] != torch.Size([b, n]):
+            self.zero_v = torch.zeros(b, n, h * self.num_blocks, d // h).to(q)
+        # l + (1 - l) * sigmoid(x)
+        if lower_bound is not None:
+            f = lower_bound + (1 - lower_bound) * F.sigmoid(f)
+            log_f = torch.log(f)
+        else:
+            log_f = F.logsigmoid(f)
+        # b n h 1
+        if self.use_beta:
+            beta = F.sigmoid(self.bet_proj(x)).unsqueeze(-1)
+            if self.beta_activation == "neg":
+                beta = beta * 2
+        else:
+            beta = 2
+        # act
+        q = self.q_act(q)
+        k = self.k_act(k)
+        v = self.v_act(v)
+
+        # h is num_head, d is head dimension
+        q, k, v, log_f = map(
+            lambda x: rearrange(x, "... (h d) -> ... h d", d=self.head_dim),
+            [q, k, v, log_f],
+        )
+
+        if self.num_blocks > 1:
+            q = rearrange(q, "b n h (k d) -> b n (h k) d", k=self.num_blocks)
+            k = rearrange(k, "b n h (k d) -> b n (h k) d", k=self.num_blocks)
+            log_f = rearrange(log_f, "b n h (k d) -> b n (h k) d", k=self.num_blocks)
+            v = repeat(v, "b n h e -> b n (h k) e", k=self.num_blocks)
+            if self.use_beta:
+                beta = repeat(beta, "b n h d -> b n (h k) d", k=self.num_blocks)
+
+        if self.norm_q:
+            q = l2_norm(q)
+        k = l2_norm(k)
+        if self.norm_v:
+            v = l2_norm(v)
+
+        # TODO: update this
+        recurrent_state = None
+        q_offset = 0
+        if past_key_values is not None and len(past_key_values) > self.layer_idx:
+            recurrent_state = past_key_values[self.layer_idx]["recurrent_state"][0]
+            q_offset = past_key_values.get_seq_length(self.layer_idx)
+
+        use_attn_mask = (
+            attention_mask is not None and not attention_mask.all() and (n > 1)
+        )
+        # left padding
+        if use_attn_mask:
+            start = q_offset
+            attention_mask_ = attention_mask[:, start:].unsqueeze(-1).unsqueeze(-1)
+            k = k.masked_fill(attention_mask_ == 0, 0)
+            log_f = log_f.masked_fill(attention_mask_ == 0, 0)
+
+        k_ = k * (-beta)
+        a = torch.cat([k_ * torch.exp(log_f), k_], dim=1)
+        b = torch.cat([k, k], dim=1)
+        q = torch.cat([self.zero_qk, q], dim=1)
+        k = torch.cat([self.zero_qk, k], dim=1)
+        v = torch.cat([self.zero_v, v], dim=1)
+        log_f = torch.cat([log_f, self.zero_qk], dim=1)
+        log_f, a, b, k, v, q = map(
+            lambda x: rearrange(x, "b (c n) ... -> b (n c) ... ", c=2),
+            [log_f, a, b, k, v, q],
+        )
+
+        scale = 1.
+        if self.causal:
+            dtype = q.dtype
+            if self.training or use_cache:
+                fn = chunk_dplr_delta_rule
+            else:
+                fn = fused_recurrent_dplr_delta_rule
+
+            output, recurrent_state = fn(
+                q=q,
+                k=k.to(dtype),
+                v=v.to(dtype),
+                a=a.to(dtype),
+                b=b.to(dtype),
+                gk=log_f.to(dtype),
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                scale=scale,
+                head_first=False,
+            )
+        else:
+            assert False
+
+        output = rearrange(output, "b (n c) ... -> b (c n) ...", c=2)
+        output = output[:, -n:]
+
+        if self.num_blocks > 1:
+            output = rearrange(
+                output, "b n (h k) d -> b n h k d", k=self.num_blocks
+            ).sum(dim=-2)
+
+        if past_key_values is not None:
+            past_key_values.update(
+                recurrent_state=[recurrent_state],
+                layer_idx=self.layer_idx,
+                offset=n,
+            )
+
+        # reshape
+        output = rearrange(output, "b n h d -> b n (h d)")
+        if self.use_output_gate:
+            gate = self.output_gate(x)
+            output = self.norm(output, gate)
+        else:
+            output = self.norm(output)
+
+        # out proj
+        output = self.o_proj(output)
+
+        return output, past_key_values
