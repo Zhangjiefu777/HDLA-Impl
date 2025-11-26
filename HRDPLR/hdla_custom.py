@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from HRDPLR import (
+from . import (
     chunk_hrdplr_delta_rule,
     fused_recurrent_dplr_delta_rule,
 )
