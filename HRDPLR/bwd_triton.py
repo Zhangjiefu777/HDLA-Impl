@@ -16,11 +16,14 @@ Test passed
 """
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({
+            "BV": BV, 
+        }, num_warps=num_warps, num_stages=num_stages)
+        for BV in [16, 32, 64, 128]
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [2, 3, 4]
     ],
-    key=['BV', 'BT'],
+    key=['BT'],
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -110,11 +113,14 @@ Test passed
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({
+            "BV": BV, 
+        }, num_warps=num_warps, num_stages=num_stages)
+        for BV in [16, 32, 64]
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'BK', 'BV', "V"],
+    key=['BT', 'BK', "V"],
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -288,11 +294,15 @@ Test passed
 """
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({
+            "BK": BK, "BV": BV, 
+        }, num_warps=num_warps, num_stages=num_stages)
+        for BK in [16, 32, 64]
+        for BV in [16, 32, 64]
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'BK', 'BV'],
+    key=['BT'],
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit
@@ -478,11 +488,15 @@ def chunk_dplr_bwd_o_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({
+            "BK": BK, "BV": BV, 
+        }, num_warps=num_warps, num_stages=num_stages)
+        for BK in [16, 32, 64]
+        for BV in [16, 32, 64]
         for num_warps in [2, 4, 8, 16]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'BK', 'BV'],
+    key=['BT',],
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -597,7 +611,18 @@ def prepare_wy_repr_bwd_kernel(
     b_dA_ab_inv = tl.where(m_i_ab, b_dA_ab_inv, 0)
     tl.store(p_dAab, b_dA_ab_inv, boundary_check=(0, 1))
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({
+            "BK": BK, 
+        }, num_warps=num_warps, num_stages=num_stages)
+        for BK in [16, 32, 64]
+        for num_warps in NUM_WARPS_AUTOTUNE
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BT', 'K'],
+    use_cuda_graph=use_cuda_graph,
+)
 @triton.jit(do_not_specialize=['T'])
 def chunk_hrdplr_bwd_kernel_intra(
     q, 
@@ -865,7 +890,7 @@ def chunk_hrdplr_bwd_kernel_intra(
         triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [2, 3, 4]
-        for BK in [32, 64]
+        for BK in [16, 32, 64]
     ],
     key=['BK', 'BT', 'K'],
     use_cuda_graph=use_cuda_graph,

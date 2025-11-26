@@ -29,12 +29,12 @@ def chunk_dplr_bwd_dAu(
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
 
     NT = triton.cdiv(T, BT)
-    if check_shared_mem('ampere'):  # A100
-        BV = min(triton.next_power_of_2(V), 128)
-    elif check_shared_mem('ada'):  # 4090
-        BV = min(triton.next_power_of_2(V), 64)
-    else:
-        BV = min(triton.next_power_of_2(V), 32)
+    # if check_shared_mem('ampere'):  # A100
+    #     BV = min(triton.next_power_of_2(V), 128)
+    # elif check_shared_mem('ada'):  # 4090
+    #     BV = min(triton.next_power_of_2(V), 64)
+    # else:
+    #     BV = min(triton.next_power_of_2(V), 32)
 
     dA_qk = torch.empty(B, T, H, BT, dtype=torch.float, device=v.device)
     dA_qb = torch.empty(B, T, H, BT * RANK_AB, dtype=torch.float, device=v.device)
@@ -56,7 +56,7 @@ def chunk_dplr_bwd_dAu(
         H,
         V,
         BT,
-        BV,
+        # BV,
     )
     return dv_new, dA_qk, dA_qb
 
@@ -79,15 +79,17 @@ def chunk_dplr_bwd_dhu(
 
     assert BK <= 256, "current kernel does not support head dimension being larger than 256."
     # H100
-    if check_shared_mem('hopper', qg.device.index):
-        BV = 64
-        BC = 64 if K <= 128 else 32
-    elif check_shared_mem('ampere', qg.device.index):  # A100
-        BV = 32
-        BC = 32
-    else:  # Etc: 4090
-        BV = 16
-        BC = 16
+    # if check_shared_mem('hopper', qg.device.index):
+    #     BV = 64
+    #     BC = 64 if K <= 128 else 32
+    # elif check_shared_mem('ampere', qg.device.index):  # A100
+    #     BV = 32
+    #     BC = 32
+    # else:  # Etc: 4090
+    #     BV = 16
+    #     BC = 16
+
+    BC = 16
 
     N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     dh = qg.new_empty(B, NT, H, K, V)
@@ -95,9 +97,8 @@ def chunk_dplr_bwd_dhu(
     dv2 = torch.zeros_like(dv)
 
     NK = triton.cdiv(K, BK)
-    NV = triton.cdiv(V, BV)
-
-    grid = (NK, NV, N * H)
+    
+    def grid(meta): return (NK, triton.cdiv(V, meta["BV"]), N * H)
     chunk_dplr_bwd_kernel_dhu[grid](
         qg=qg, # [B, T, H, K]
         bg=bg, # [B, T, H, K]
@@ -116,7 +117,7 @@ def chunk_dplr_bwd_dhu(
         BT=BT,
         BC=BC,
         BK=BK,
-        BV=BV,
+        # BV=BV,
         RANK_AB=RANK_AB, 
     )
     return dh, dh0, dv2
@@ -174,15 +175,15 @@ def chunk_dplr_bwd_o(
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    BK = min(triton.next_power_of_2(K), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
-    BV = min(triton.next_power_of_2(V), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
-    NK = triton.cdiv(K, BK)
+    # BK = min(triton.next_power_of_2(K), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
+    # BV = min(triton.next_power_of_2(V), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
+    # NK = triton.cdiv(K, BK)
     dq = torch.empty_like(k)
     dk = torch.empty_like(k)
     dw = torch.empty_like(w)
     db = torch.empty_like(b)
-    grid = (NK, NT, B * H)
 
+    def grid(meta): return (triton.cdiv(K, meta["BK"]), NT, B * H)
     dgk_last = torch.empty(B, NT, H, K, dtype=torch.float, device=w.device)
     chunk_dplr_bwd_o_kernel[grid](
         v=v, # [B, T, H, V]
@@ -209,8 +210,8 @@ def chunk_dplr_bwd_o(
         RANK_AB=RANK_AB, 
         BT=BT,
         BT_AB=BT * RANK_AB, 
-        BK=BK,
-        BV=BV,
+        # BK=BK,
+        # BV=BV,
     )
     return dq, dk, dw, db, dgk_last
 
@@ -235,8 +236,8 @@ def chunk_dplr_bwd_wy(
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = min(triton.next_power_of_2(K), 64)
-    BV = min(triton.next_power_of_2(V), 64) if check_shared_mem() else min(triton.next_power_of_2(V), 32)
+    # BK = min(triton.next_power_of_2(K), 64)
+    # BV = min(triton.next_power_of_2(V), 64) if check_shared_mem() else min(triton.next_power_of_2(V), 32)
 
     dA_ab = torch.empty_like(A_ab_inv, dtype=torch.float)
     dA_ak = torch.empty_like(A_ak, dtype=torch.float)
@@ -265,8 +266,8 @@ def chunk_dplr_bwd_wy(
         V=V,
         BT=BT,
         BT_AB=BT * RANK_AB, 
-        BK=BK,
-        BV=BV,
+        # BK=BK,
+        # BV=BV,
     )
     return dA_ab, dA_ak, dv, dag
 
@@ -293,13 +294,13 @@ def chunk_dplr_bwd_dqk_intra(
 ):
     B, T, H, K = q.shape
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    BK = min(64, triton.next_power_of_2(K)) if check_shared_mem() else min(32, triton.next_power_of_2(K))
+    # BK = min(64, triton.next_power_of_2(K)) if check_shared_mem() else min(32, triton.next_power_of_2(K))
 
     BC = 16 # TODO
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    NK = triton.cdiv(K, BK)
+    
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -308,7 +309,7 @@ def chunk_dplr_bwd_dqk_intra(
     dgk = torch.empty_like(gi, dtype=torch.float)
     dgk_offset = torch.empty_like(gi, dtype=torch.float)
 
-    grid = (NK, NT, B * H)
+    def grid(meta): return (triton.cdiv(K, meta["BK"]), NT, B * H)
     chunk_hrdplr_bwd_kernel_intra[grid](
         q=q, 
         k=k, 
@@ -341,7 +342,7 @@ def chunk_dplr_bwd_dqk_intra(
         BT_AB=BT * RANK_AB, 
         BC=BC,
         BC_AB=BC * RANK_AB, 
-        BK=BK,
+        # BK=BK,
         IS_VARLEN=False, 
         GATHER_SUPPORTED=is_gather_supported, 
     )
