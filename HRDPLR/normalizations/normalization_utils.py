@@ -20,7 +20,7 @@ logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO").upper(),
     stream=sys.stdout,
 )
-logger = logging.getLogger("xmixers")
+logger = logging.getLogger("HDLA")
 
 
 def is_dist_avail_and_initialized() -> bool:

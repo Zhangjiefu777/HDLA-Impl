@@ -5,9 +5,7 @@ from torch import Size
 
 _shape_t = Union[int, List[int], Size]
 
-
-from xopes.ops.normalize import group_srms_norm_fn
-
+from .normalize import group_srms_norm_fn
 
 class GroupSRMSNorm(torch.nn.Module):
     def __init__(

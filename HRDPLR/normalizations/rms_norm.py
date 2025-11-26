@@ -1,17 +1,8 @@
-"""
-SimpleRMSNorm in https://arxiv.org/abs/2307.14995
-RMSNorm in https://arxiv.org/pdf/1910.07467.pdf
-GatedRMSNorm in https://arxiv.org/pdf/2104.07012.pdf
-
-Reference:
-https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py
-https://github.com/bzhangGo/zero/blob/master/modules/rela.py
-"""
 import torch
 import torch.nn as nn
 from fla.modules import RMSNorm
 
-from xmixers.utils import XMIXERS_DEBUG, print_module, print_params
+from .normalization_utils import HDLA_DEBUG, print_module, print_params
 
 from .utils import NormOp
 
@@ -19,7 +10,7 @@ from .utils import NormOp
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5, **kwargs):
         super().__init__()
-        if XMIXERS_DEBUG:
+        if HDLA_DEBUG:
             # get local varables
             params = locals()
             # print params
@@ -59,7 +50,7 @@ class RMSNormFusedGate(torch.nn.Module):
         self, dim: int, eps: float = 1e-5, gate_act="sigmoid", gate_pos="pre", **kwargs
     ):
         super().__init__()
-        if XMIXERS_DEBUG:
+        if HDLA_DEBUG:
             # get local varables
             params = locals()
             # print params
@@ -103,7 +94,7 @@ class GatedRMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-5, bias: bool = False, **kwargs) -> None:
         super().__init__()
 
-        if XMIXERS_DEBUG:
+        if HDLA_DEBUG:
             # get local varables
             params = locals()
             # print params

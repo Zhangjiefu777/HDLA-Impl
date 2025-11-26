@@ -5,13 +5,13 @@ ScaleNorm in https://arxiv.org/pdf/2202.10447.pdf
 import torch
 from torch import nn
 
-from xmixers.utils import XMIXERS_DEBUG, print_params
+from .normalization_utils import HDLA_DEBUG, print_params, print_module
 
 
 class ScaleNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-5, **kwargs) -> None:
         super().__init__()
-        if XMIXERS_DEBUG:
+        if HDLA_DEBUG:
             # get local varables
             params = locals()
             # print params

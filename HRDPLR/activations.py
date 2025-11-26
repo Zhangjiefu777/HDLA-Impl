@@ -4,11 +4,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xmixers.utils import XMIXERS_DEBUG, logger, print_params
+from .normalizations.utils import HDLA_DEBUG, logger, print_params
 
 
 def get_activation_fn(activation: str) -> Callable[[torch.Tensor], torch.Tensor]:
-    if XMIXERS_DEBUG:
+    if HDLA_DEBUG:
         logger.info(f"activation: {activation}")
     if activation == "gelu":
         return F.gelu
@@ -64,7 +64,7 @@ class ActLayer(nn.Module):
         activation: str,
     ) -> None:
         super().__init__()
-        if XMIXERS_DEBUG:
+        if HDLA_DEBUG:
             # get local varables
             params = locals()
             # print params
