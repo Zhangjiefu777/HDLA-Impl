@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .normalizations.utils import HDLA_DEBUG, logger, print_params
+from .normalizations.normalization_utils import HDLA_DEBUG, logger, print_params
 
 
 def get_activation_fn(activation: str) -> Callable[[torch.Tensor], torch.Tensor]:
