@@ -16,6 +16,32 @@ from .activations import get_activation_fn
 from .normalizations import get_norm_fn, l2_norm
 from .normalizations.normalization_utils import HDLA_DEBUG, _initialize_weights, print_module, print_params
 
+@torch.compile
+def parameterize_a_b(
+    beta: torch.Tensor, 
+    k: torch.Tensor, 
+    log_f: torch.Tensor, 
+):
+    a_t1 = -beta * k # [B, T, H, 1] * [B, T, H, K]
+    a_t2 = -beta * torch.exp(log_f) * k # [B, T, H, 1] * [B, T, H, K] * [B, T, H, K]
+
+    b_t1 = k
+    b_t2 = k
+
+    a_1 = a_t1 # [B, T, H, K]
+    a_2 = a_t2 + a_t1 * torch.sum(
+        b_t1 * a_t2, dim=-1, keepdim=True, # [B, T, H, K] -> [B, T, H, 1] 
+    ) # [B, T, H, K]
+    
+    b_1 = torch.exp(log_f) * b_t1
+    b_2 = b_t2
+
+    a_stacked = torch.stack([a_1, a_2], dim=2) # [B, T, 2, H, K]
+    b_stacked = torch.stack([b_1, b_2], dim=2) # [B, T, 2, H, K]
+
+    a = rearrange(a_stacked, 'b t r h k -> b (t r) h k')
+    b = rearrange(b_stacked, 'b t r h k -> b (t r) h k')
+
 class HDLA_Custom(nn.Module):
     """
     S[t] = (I - k * k ^ T) * Diag(f) * (I - k * k ^ T) * S[t-1] + k * v ^ T
@@ -261,25 +287,7 @@ class HDLA_Custom(nn.Module):
         H  = Diag(f) - [a_{t, 1} (I - a_{t, 1} @ b_{t, 1}.T) @ a_{t, 2}][D_{t, 2}b_{t, 1} b_{t, 2}].T
         """
        
-        a_t1 = -beta * k # [B, T, H, 1] * [B, T, H, K]
-        a_t2 = -beta * torch.exp(log_f) * k # [B, T, H, 1] * [B, T, H, K] * [B, T, H, K]
-
-        b_t1 = k
-        b_t2 = k
-
-        a_1 = a_t1 # [B, T, H, K]
-        a_2 = a_t2 + a_t1 * torch.sum(
-            b_t1 * a_t2, dim=-1, keepdim=True, # [B, T, H, K] -> [B, T, H, 1] 
-        ) # [B, T, H, K]
-        
-        b_1 = torch.exp(log_f) * b_t1
-        b_2 = b_t2
-
-        a_stacked = torch.stack([a_1, a_2], dim=2) # [B, T, 2, H, K]
-        b_stacked = torch.stack([b_1, b_2], dim=2) # [B, T, 2, H, K]
-
-        a = rearrange(a_stacked, 'b t r h k -> b (t r) h k')
-        b = rearrange(b_stacked, 'b t r h k -> b (t r) h k')
+        a, b = parameterize_a_b(beta=beta, k=k, log_f=log_f)
 
         scale = 1.
         if self.causal:
@@ -312,7 +320,6 @@ class HDLA_Custom(nn.Module):
                     output_final_state=use_cache,
                     scale=scale,
                     head_first=False,
-                    chunk_size=16, 
                 )
         else:
             assert False

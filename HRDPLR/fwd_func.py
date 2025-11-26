@@ -7,6 +7,7 @@ from .fwd_triton import (
     chunk_dplr_fwd_A_kernel_intra_sub_intra_rab_generalized, 
     chunk_dplr_fwd_A_kernel_intra_sub_inter_rab_generalized, 
     fwd_prepare_wy_repr_kernel_chunk32, 
+    prepare_wy_repr_fwd_kernel_chunk64, 
     fwd_wu_kernel, 
     chunk_dplr_fwd_kernel_h, 
     chunk_dplr_fwd_kernel_o, 
@@ -167,19 +168,31 @@ def fwd_prepare_wy_repr(
 
     BC = min(BT, 16)
     
-    fwd_fn = fwd_prepare_wy_repr_kernel_chunk32
-
     A_ab_inv = torch.empty_like(A_ab)
     
+    # fwd_fn = fwd_prepare_wy_repr_kernel_chunk32
+    # grid = (NT, B * H)
+    # fwd_fn[grid](
+    #     A_ab, # [B, T * RANK_AB, H, BT * RANK_AB]
+    #     A_ab_inv, # [B, T * RANK_AB, H, BT * RANK_AB]
+    #     B, 
+    #     H, 
+    #     T, 
+    #     BT, 
+    #     RANK_AB, 
+    # )
+
+    fwd_fn = prepare_wy_repr_fwd_kernel_chunk64
     grid = (NT, B * H)
     fwd_fn[grid](
-        A_ab, # [B, T * RANK_AB, H, BT * RANK_AB]
-        A_ab_inv, # [B, T * RANK_AB, H, BT * RANK_AB]
-        B, 
-        H, 
-        T, 
-        BT, 
-        RANK_AB, 
+        A_ab,
+        A_ab_inv,
+        None,
+        None,
+        T * RANK_AB, # T * 2
+        H,
+        BT * RANK_AB, # BT * 2
+        BT,
     )
 
     w, u = fwd_wu(

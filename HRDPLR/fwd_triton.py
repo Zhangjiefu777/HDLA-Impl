@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.utils.op import gather
+from fla.utils import is_gather_supported, use_cuda_graph
+
 """
 Operator 1 (√)
 """
@@ -581,6 +584,89 @@ def fwd_prepare_wy_repr_kernel_chunk32(
 
     b_A += tl.arange(0, BT * RANK_AB)[:, None] == tl.arange(0, BT * RANK_AB)[None, :]
     tl.store(p_A_inv, b_A.to(p_A_inv.dtype.element_ty), boundary_check=(0, 1))
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['BC'],
+    use_cuda_graph=use_cuda_graph,
+)
+@triton.jit(do_not_specialize=['T'])
+def prepare_wy_repr_fwd_kernel_chunk64(
+    A_ab,
+    A_ab_inv,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    GATHER_SUPPORTED: tl.constexpr = is_gather_supported
+):
+    """
+    Directly borrowed from fla.
+    """
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    p_A1 = tl.make_block_ptr(A_ab + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT, 0), (BC, BC), (1, 0))
+    p_A2 = tl.make_block_ptr(A_ab + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT + BC, BC), (BC, BC), (1, 0))
+    p_A3 = tl.make_block_ptr(A_ab + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT + BC, 0), (BC, BC), (1, 0))
+    p_A_inv1 = tl.make_block_ptr(A_ab_inv + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT, 0), (BC, BC), (1, 0))
+    p_A_inv2 = tl.make_block_ptr(A_ab_inv + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT + BC, BC), (BC, BC), (1, 0))
+    p_A_inv3 = tl.make_block_ptr(A_ab_inv + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT + BC, 0), (BC, BC), (1, 0))
+    p_A_inv4 = tl.make_block_ptr(A_ab_inv + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT, BC), (BC, BC), (1, 0))
+
+    b_A = tl.load(p_A1, boundary_check=(0, 1))
+    b_A2 = tl.load(p_A2, boundary_check=(0, 1))
+    b_A3 = tl.load(p_A3, boundary_check=(0, 1))
+    b_A = tl.where(tl.arange(0, BC)[:, None] > tl.arange(0, BC)[None, :], b_A, 0)
+    b_A2 = tl.where(tl.arange(0, BC)[:, None] > tl.arange(0, BC)[None, :], b_A2, 0)
+
+    for i in range(1, BC):
+        if GATHER_SUPPORTED:
+            row_idx = tl.full([1, BC], i, dtype=tl.int16)
+            # [1, BK] -> [BK]
+            b_a = tl.sum(gather(b_A, row_idx, axis=0), 0)
+            b_a2 = tl.sum(gather(b_A2, row_idx, axis=0), 0)
+        else:
+            mask = tl.arange(0, BC) == i
+            b_a = tl.sum(tl.where(mask[:, None], b_A, 0), 0)
+            b_a2 = tl.sum(tl.where(mask[:, None], b_A2, 0), 0)
+        mask = tl.arange(0, BC) == i
+        # b_a = tl.sum(tl.where(mask[:, None], b_A, 0), 0)
+        # b_a2 = tl.sum(tl.where(mask[:, None], b_A2, 0), 0)
+        b_a = b_a + tl.sum(b_a[:, None] * b_A, 0) * (tl.arange(0, BC) < i)
+        b_a2 = b_a2 + tl.sum(b_a2[:, None] * b_A2, 0) * (tl.arange(0, BC) < i)
+        b_A = tl.where(mask[:, None], b_a, b_A)
+        b_A2 = tl.where(mask[:, None], b_a2, b_A2)
+
+    # blockwise computation of lower triangular matrix's inverse
+    # i.e., [A11, 0; A21, A22]^-1 = [A11^-1, 0; -A22^-1 A21 A11^-1, A22^-1]
+    b_A += tl.arange(0, BC)[:, None] == tl.arange(0, BC)[None, :]
+    b_A2 += tl.arange(0, BC)[:, None] == tl.arange(0, BC)[None, :]
+    b_A3 = tl.dot(tl.dot(b_A2, b_A3), b_A)
+    # tl.debug_barrier()
+    tl.store(p_A_inv1, b_A.to(p_A_inv1.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+    tl.store(p_A_inv2, b_A2.to(p_A_inv2.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+    tl.store(p_A_inv3, b_A3.to(p_A_inv3.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+    # causal mask
+    tl.store(p_A_inv4, tl.zeros([BC, BC], dtype=tl.float32).to(p_A_inv4.dtype.element_ty), boundary_check=(0, 1))
+
+
 
 """
 Operator 4 (Compute w, u according to formula (19), (20) in HDLA paper)
